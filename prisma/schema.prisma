@@ -1,0 +1,194 @@
+// =============================================================================
+// B2B Healthcare P2P Marketplace — Prisma Schema
+// =============================================================================
+// Architecture: Multi-tenant (hospitals = organizations). Users belong to
+// exactly one hospital. Listings are seller-owned; orders link buyer/seller
+// with clear state machine. Audit log is append-only for compliance.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+// Multi-tenant: Hospitals are organizations
+// -----------------------------------------------------------------------------
+
+enum OrganizationStatus {
+  PENDING   // Awaiting super-admin approval
+  APPROVED  // Can login and participate
+}
+
+model Organization {
+  id         String             @id @default(cuid())
+  name       String
+  status     OrganizationStatus  @default(PENDING)
+  inviteCode String?            @unique @map("invite_code") // Share with team to join as PROCUREMENT
+  createdAt  DateTime           @default(now())
+  updatedAt  DateTime           @updatedAt
+
+  users    User[]
+  listings Listing[]           @relation("SellerListings")
+  ordersAsBuyer  Order[]        @relation("BuyerOrders")
+  ordersAsSeller Order[]        @relation("SellerOrders")
+
+  @@map("organizations")
+}
+
+enum UserRole {
+  SUPER_ADMIN // Platform: approve hospitals (organizations)
+  ADMIN       // Hospital: manage listings
+  PROCUREMENT // Hospital: create orders only
+}
+
+model User {
+  id             String    @id @default(cuid())
+  email          String    @unique
+  passwordHash   String    @map("password_hash")
+  firstName      String?   @map("first_name")
+  lastName       String?   @map("last_name")
+  role           UserRole
+  organizationId String?   // Null for SUPER_ADMIN
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  addresses     Address[]
+
+  @@index([organizationId])
+  @@index([email])
+  @@map("users")
+}
+
+// Delivery addresses (per user, for checkout)
+model Address {
+  id          String   @id @default(cuid())
+  userId      String   @map("user_id")
+  label       String?  // e.g. "Main Office", "Warehouse"
+  addressLine1 String @map("address_line1")
+  addressLine2 String? @map("address_line2")
+  city        String
+  state       String?
+  postalCode  String   @map("postal_code")
+  country     String   @default("US")
+  isDefault   Boolean  @default(false) @map("is_default")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("addresses")
+}
+
+// -----------------------------------------------------------------------------
+// Categories: Managed by super admin; used in listing create/edit and filters
+// -----------------------------------------------------------------------------
+
+model Category {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("categories")
+}
+
+// -----------------------------------------------------------------------------
+// Listings: Surplus medical supplies offered by a hospital
+// -----------------------------------------------------------------------------
+
+enum ListingStatus {
+  ACTIVE   // Searchable, can be ordered
+  SOLD_OUT // quantity_available = 0
+  EXPIRED  // expiry_date passed
+  INACTIVE // Seller deactivated
+}
+
+model Listing {
+  id                 String        @id @default(cuid())
+  hospitalId         String        @map("hospital_id") // seller organization
+  title              String
+  description        String?
+  category           String
+  quantityAvailable  Int           @map("quantity_available")
+  pricePerUnit       Decimal       @map("price_per_unit") @db.Decimal(12, 2)
+  expiryDate         DateTime?     @map("expiry_date") @db.Date
+  status             ListingStatus @default(ACTIVE)
+  createdAt          DateTime      @default(now()) @map("created_at")
+  updatedAt          DateTime      @updatedAt @map("updated_at")
+
+  hospital Organization @relation("SellerListings", fields: [hospitalId], references: [id], onDelete: Cascade)
+  orders  Order[]
+
+  // Indexes: marketplace list (active + not expired), seller dashboard, category filter, default sort
+  @@index([status, expiryDate])
+  @@index([status, createdAt])
+  @@index([hospitalId])
+  @@index([category])
+  @@index([status, category])
+  @@map("listings")
+}
+
+// -----------------------------------------------------------------------------
+// Orders: State machine — PENDING → RESERVED → CONFIRMED/REJECTED/EXPIRED/CANCELLED → COMPLETED
+// -----------------------------------------------------------------------------
+
+enum OrderStatus {
+  PENDING   // Initial (optional; can go straight to RESERVED in same tx)
+  RESERVED  // Stock deducted, awaiting seller response
+  CONFIRMED // Seller accepted
+  REJECTED  // Seller rejected; stock restored
+  CANCELLED // Buyer or system cancelled; stock restored if was RESERVED
+  EXPIRED   // Seller did not respond in time; stock restored
+  COMPLETED // Fulfilled (mock; no real shipment)
+}
+
+model Order {
+  id               String      @id @default(cuid())
+  buyerHospitalId  String      @map("buyer_hospital_id")
+  sellerHospitalId String      @map("seller_hospital_id")
+  listingId        String      @map("listing_id")
+  quantity         Int
+  totalPrice       Decimal     @map("total_price") @db.Decimal(12, 2)
+  status           OrderStatus @default(PENDING)
+  reservedAt       DateTime?   @map("reserved_at") // When moved to RESERVED (for timeout)
+  deliveryAddress  Json?       @map("delivery_address") // Snapshot: { label, line1, line2?, city, state, postalCode, country }
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  buyerHospital  Organization @relation("BuyerOrders", fields: [buyerHospitalId], references: [id], onDelete: Cascade)
+  sellerHospital Organization @relation("SellerOrders", fields: [sellerHospitalId], references: [id], onDelete: Cascade)
+  listing        Listing      @relation(fields: [listingId], references: [id], onDelete: Restrict)
+
+  @@index([buyerHospitalId])
+  @@index([sellerHospitalId])
+  @@index([listingId])
+  @@index([status])
+  @@index([status, reservedAt]) // For cron: find RESERVED orders past timeout
+  @@map("orders")
+}
+
+// -----------------------------------------------------------------------------
+// Audit log: Append-only, for listing changes and order state transitions
+// -----------------------------------------------------------------------------
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  entityType  String   @map("entity_type")  // "Listing" | "Order"
+  entityId    String   @map("entity_id")
+  action      String   // e.g. "status_change", "created", "quantity_updated"
+  performedBy String?  @map("performed_by") // User id from auth (no FK: allows stale/header ids for audit trail)
+  metadata    Json?    // Optional: old/new values for state changes
+  timestamp   DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([timestamp])
+  @@index([performedBy])
+  @@map("audit_logs")
+}

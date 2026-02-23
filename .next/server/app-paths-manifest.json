@@ -1,0 +1,12 @@
+{
+  "/api/admin/listings/route": "app/api/admin/listings/route.js",
+  "/api/auth/[...nextauth]/route": "app/api/auth/[...nextauth]/route.js",
+  "/_not-found/page": "app/_not-found/page.js",
+  "/login/page": "app/login/page.js",
+  "/page": "app/page.js",
+  "/cart/page": "app/cart/page.js",
+  "/admin/organizations/page": "app/admin/organizations/page.js",
+  "/admin/listings/page": "app/admin/listings/page.js",
+  "/profile/page": "app/profile/page.js",
+  "/admin/categories/page": "app/admin/categories/page.js"
+}
